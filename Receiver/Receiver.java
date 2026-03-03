@@ -26,6 +26,7 @@
 // - use ChaosEngine.shouldDrop(ackCount, rn)
 // - ackCount increments for every ack "attempt" (even if dropped)
 
+import java.io.File;
 import java.io.FileOutputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -95,16 +96,29 @@ public class Receiver
             return;
         }
 
-        Integer rnvalue = parsenonnegativeint(rntext, "RN");
+        if (outputfiletext.length() == 0)
+        {
+            System.out.println("output_file is required.");
+            return;
+        }
+
+        // validate output file path early (so we dont fail during handshake)
+        if (!validateoutputfile(outputfiletext))
+        {
+            return;
+        }
+
+        // rn can be negative; treat it as 0 (no ack loss)
+        Integer rnvalue = parseint(rntext, "RN");
         if (rnvalue == null)
         {
             return;
         }
 
-        if (outputfiletext.length() == 0)
+        if (rnvalue < 0)
         {
-            System.out.println("output_file is required.");
-            return;
+            System.out.println("RN is negative. treating RN as 0 (no ACK loss).");
+            rnvalue = 0;
         }
 
         try
@@ -323,6 +337,14 @@ public class Receiver
         }
     }
 
+    private void sendpacket(DSPacket packet, InetAddress addr, int port) throws Exception
+    {
+        byte[] bytes = packet.toBytes();
+
+        DatagramPacket dp = new DatagramPacket(bytes, bytes.length, addr, port);
+        datasock.send(dp);
+    }
+
     private void sendack(int seq) throws Exception
     {
         // increment ackcount for every ack attempt (even if dropped)
@@ -339,11 +361,7 @@ public class Receiver
         System.out.println("sending ACK seq=" + seq + " ackcount=" + ackcount + " rn=" + rn);
 
         DSPacket ack = new DSPacket(DSPacket.TYPE_ACK, seq, null);
-
-        byte[] bytes = ack.toBytes();
-
-        DatagramPacket dp = new DatagramPacket(bytes, bytes.length, senderaddr, senderackport);
-        datasock.send(dp);
+        sendpacket(ack, senderaddr, senderackport);
     }
 
     // validation helpers
@@ -399,6 +417,79 @@ public class Receiver
         }
 
         return v;
+    }
+
+    private Integer parseint(String text, String name)
+    {
+        if (text == null)
+        {
+            text = "";
+        }
+
+        text = text.trim();
+
+        if (text.length() == 0)
+        {
+            System.out.println(name + " is required.");
+            return null;
+        }
+
+        int v;
+
+        try
+        {
+            v = Integer.parseInt(text);
+        }
+        catch (Exception ex)
+        {
+            System.out.println(name + " must be a number.");
+            return null;
+        }
+
+        return v;
+    }
+
+    private boolean validateoutputfile(String path)
+    {
+        try
+        {
+            File f = new File(path);
+
+            if (f.exists() && f.isDirectory())
+            {
+                System.out.println("output_file is a directory, not a file.");
+                return false;
+            }
+
+            File parent = f.getAbsoluteFile().getParentFile();
+            if (parent != null)
+            {
+                if (!parent.exists())
+                {
+                    System.out.println("output_file parent directory does not exist: " + parent.getPath());
+                    return false;
+                }
+
+                if (!parent.canWrite())
+                {
+                    System.out.println("output_file parent directory is not writable: " + parent.getPath());
+                    return false;
+                }
+            }
+
+            if (f.exists() && !f.canWrite())
+            {
+                System.out.println("output_file is not writable: " + path);
+                return false;
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            System.out.println("output_file is invalid: " + ex.getMessage());
+            return false;
+        }
     }
 
     private void printusage()

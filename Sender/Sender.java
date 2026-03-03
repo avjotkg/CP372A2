@@ -396,6 +396,19 @@ public class Sender
         sock.send(dp);
     }
 
+    // receive helpers
+
+    private DSPacket receivepacket() throws Exception
+    {
+        byte[] buf = new byte[DSPacket.MAX_PACKET_SIZE];
+        DatagramPacket dp = new DatagramPacket(buf, buf.length);
+
+        sock.receive(dp);
+
+        // parse raw 128 bytes into dspacket
+        return new DSPacket(dp.getData());
+    }
+
     // ack receive helpers
 
     private DSPacket receiveack(int expectedseq)
@@ -407,12 +420,7 @@ public class Sender
         {
             try
             {
-                byte[] buf = new byte[DSPacket.MAX_PACKET_SIZE];
-                DatagramPacket dp = new DatagramPacket(buf, buf.length);
-
-                sock.receive(dp);
-
-                DSPacket p = new DSPacket(dp.getData());
+                DSPacket p = receivepacket();
 
                 if (p.getType() != DSPacket.TYPE_ACK)
                 {
