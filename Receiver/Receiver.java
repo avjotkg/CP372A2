@@ -11,7 +11,7 @@
 // - first DATA expected seq=1
 // - receiver tracks expectedseq and accepts only in-order data
 // - duplicates/out-of-order are not written; receiver re-acks last in-order seq
-// - EOT is accepted and acked; receiver closes and exits
+// - EOT is accepted and acked; receiver closes output file and exits only after the EOT ack is actually sent
 
 // stop-and-wait receiver behavior:
 // - after receiving SOT: set expectedseq=1, lastinorder=0, open output file (once)
@@ -19,7 +19,10 @@
 //   if seq==expectedseq: write payload, ack seq, advance expectedseq
 //   else: do not write, re-ack lastinorder
 // - on EOT:
-//   ack eot seq, close output file, exit
+//   attempt to ack eot seq
+//   close output file once
+//   if ack was dropped by chaos, do not exit yet (wait for sender retransmit)
+//   if ack was actually sent, exit
 
 // chaos rules (ack loss simulation):
 // - receiver drops every rn-th ack (including SOT and EOT acks)
@@ -286,7 +289,7 @@ public class Receiver
         }
     }
 
-    // teardown: on eot, ack and exit
+    // teardown: on eot, ack and exit only if the ack was actually sent (not dropped)
     private boolean handleeot(int seq) throws Exception
     {
         if (!handshaked)
@@ -297,9 +300,9 @@ public class Receiver
 
         System.out.println("received EOT seq=" + seq);
 
-        sendack(seq);
+        boolean sent = sendack(seq);
 
-        // close file and finish
+        // close file once after first eot is seen (even if ack is dropped)
         try
         {
             if (out != null)
@@ -313,8 +316,16 @@ public class Receiver
             // ignore
         }
 
-        System.out.println("transfer complete. receiver exiting.");
-        return true;
+        if (sent)
+        {
+            System.out.println("transfer complete. receiver exiting.");
+            return true;
+        }
+        else
+        {
+            System.out.println("eot ack was dropped. waiting for sender to retransmit eot...");
+            return false;
+        }
     }
 
     // udp helpers
@@ -345,7 +356,7 @@ public class Receiver
         datasock.send(dp);
     }
 
-    private void sendack(int seq) throws Exception
+    private boolean sendack(int seq) throws Exception
     {
         // increment ackcount for every ack attempt (even if dropped)
         ackcount++;
@@ -355,13 +366,15 @@ public class Receiver
         if (drop)
         {
             System.out.println("sending ACK seq=" + seq + " (dropped by chaos) ackcount=" + ackcount + " rn=" + rn);
-            return;
+            return false;
         }
 
         System.out.println("sending ACK seq=" + seq + " ackcount=" + ackcount + " rn=" + rn);
 
         DSPacket ack = new DSPacket(DSPacket.TYPE_ACK, seq, null);
         sendpacket(ack, senderaddr, senderackport);
+
+        return true;
     }
 
     // validation helpers
