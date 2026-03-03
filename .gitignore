@@ -1,0 +1,15 @@
+# Java
+*.class
+*.log
+
+# VS Code
+.vscode/
+
+# Mac / Windows junk
+.DS_Store
+Thumbs.db
+
+# Build folders
+bin/
+out/
+target/
