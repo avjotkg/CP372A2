@@ -279,7 +279,7 @@ public class Sender
 
             while (true)
             {
-                int bytesread = in.read(buffer);
+                int bytesread = readchunk(in, buffer);
                 if (bytesread < 0)
                 {
                     break;
@@ -316,6 +316,46 @@ public class Sender
         }
 
         return lastdataseq;
+    }
+
+    // reads up to 124 bytes, but tries hard to fill the chunk unless EOF is reached
+    // returns:
+    // -1 if EOF and no bytes read
+    // 1..124 for payload size
+    private int readchunk(FileInputStream in, byte[] buffer) throws Exception
+    {
+        int total = 0;
+
+        while (total < buffer.length)
+        {
+            int n = in.read(buffer, total, buffer.length - total);
+
+            if (n < 0)
+            {
+                break;
+            }
+
+            if (n == 0)
+            {
+                // should not happen for FileInputStream, but dont loop forever
+                break;
+            }
+
+            total += n;
+
+            // if we filled the payload, stop
+            if (total == buffer.length)
+            {
+                break;
+            }
+        }
+
+        if (total == 0)
+        {
+            return -1;
+        }
+
+        return total;
     }
 
     // teardown: send eot seq=(last data + 1) mod 128, wait for ack

@@ -20,9 +20,8 @@
 //   else: do not write, re-ack lastinorder
 // - on EOT:
 //   attempt to ack eot seq
-//   close output file once
 //   if ack was dropped by chaos, do not exit yet (wait for sender retransmit)
-//   if ack was actually sent, exit
+//   if ack was actually sent, close output file and exit
 
 // chaos rules (ack loss simulation):
 // - receiver drops every rn-th ack (including SOT and EOT acks)
@@ -55,7 +54,7 @@ public class Receiver
     private int expectedseq;
     private int lastinorder;
 
-    // chaos state
+    // chaos state (1-indexed "intended ack" count)
     private int ackcount;
 
     public static void main(String[] args)
@@ -302,22 +301,22 @@ public class Receiver
 
         boolean sent = sendack(seq);
 
-        // close file once after first eot is seen (even if ack is dropped)
-        try
-        {
-            if (out != null)
-            {
-                out.close();
-                out = null;
-            }
-        }
-        catch (Exception ex)
-        {
-            // ignore
-        }
-
         if (sent)
         {
+            // only close after the eot ack is actually sent
+            try
+            {
+                if (out != null)
+                {
+                    out.close();
+                    out = null;
+                }
+            }
+            catch (Exception ex)
+            {
+                // ignore
+            }
+
             System.out.println("transfer complete. receiver exiting.");
             return true;
         }
@@ -356,7 +355,8 @@ public class Receiver
         datasock.send(dp);
     }
 
-    private boolean sendack(int seq) throws Exception
+    // returns true if ack was actually sent, false if dropped (or failed to send)
+    private boolean sendack(int seq)
     {
         // increment ackcount for every ack attempt (even if dropped)
         ackcount++;
@@ -371,10 +371,17 @@ public class Receiver
 
         System.out.println("sending ACK seq=" + seq + " ackcount=" + ackcount + " rn=" + rn);
 
-        DSPacket ack = new DSPacket(DSPacket.TYPE_ACK, seq, null);
-        sendpacket(ack, senderaddr, senderackport);
-
-        return true;
+        try
+        {
+            DSPacket ack = new DSPacket(DSPacket.TYPE_ACK, seq, null);
+            sendpacket(ack, senderaddr, senderackport);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            System.out.println("warning: failed to send ACK seq=" + seq + " : " + ex.getMessage());
+            return false;
+        }
     }
 
     // validation helpers
