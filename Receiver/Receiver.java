@@ -28,6 +28,9 @@
 // - use ChaosEngine.shouldDrop(ackCount, rn)
 // - ackCount increments for every ack "attempt" (even if dropped)
 
+// note (gbn):
+// - this receiver is written to be "universal" (no window arg required)
+
 import java.io.File;
 import java.io.FileOutputStream;
 import java.net.DatagramPacket;
@@ -56,6 +59,10 @@ public class Receiver
 
     // chaos state (1-indexed "intended ack" count)
     private int ackcount;
+
+    // mode flags (stop-and-wait now; can enable gbn later)
+    private boolean gbnmode;
+    private int windowsize;
 
     public static void main(String[] args)
     {
@@ -144,6 +151,10 @@ public class Receiver
         lastinorder = 0;
         ackcount = 0;
 
+        // stop-and-wait is default
+        gbnmode = false;
+        windowsize = -1;
+
         try
         {
             datasock = new DatagramSocket(rcvdataport);
@@ -203,7 +214,7 @@ public class Receiver
             }
             else if (type == DSPacket.TYPE_DATA)
             {
-                handledatastopandwait(p, seq);
+                handledatapacket(p, seq);
             }
             else if (type == DSPacket.TYPE_EOT)
             {
@@ -217,6 +228,21 @@ public class Receiver
             {
                 // ignore unknown packets
             }
+        }
+    }
+
+    // this router keeps receiver "universal"
+    // - right now it always behaves as stop-and-wait
+    private void handledatapacket(DSPacket p, int seq) throws Exception
+    {
+        if (gbnmode)
+        {
+            // jason: implement gbn receive here later (buffering + cumulative acks)
+            handledatagobackn(p, seq);
+        }
+        else
+        {
+            handledatastopandwait(p, seq);
         }
     }
 
@@ -286,6 +312,13 @@ public class Receiver
             // resend ack for last in-order packet
             sendack(lastinorder);
         }
+    }
+
+    // jason: go-back-n receiver logic here
+    private void handledatagobackn(DSPacket p, int seq) throws Exception
+    {
+        // not implemented in stop-and-wait version.
+        // for jason to do
     }
 
     // teardown: on eot, ack and exit only if the ack was actually sent (not dropped)
