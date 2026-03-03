@@ -11,7 +11,7 @@
 // - first DATA expected seq=1
 // - receiver tracks expectedseq and accepts only in-order data
 // - duplicates/out-of-order are not written; receiver re-acks last in-order seq
-// - EOT is accepted and acked; receiver closes and exits
+// - EOT is accepted and acked; receiver closes output file and exits only after the EOT ack is actually sent
 
 // stop-and-wait receiver behavior:
 // - after receiving SOT: set expectedseq=1, lastinorder=0, open output file (once)
@@ -19,13 +19,19 @@
 //   if seq==expectedseq: write payload, ack seq, advance expectedseq
 //   else: do not write, re-ack lastinorder
 // - on EOT:
-//   ack eot seq, close output file, exit
+//   attempt to ack eot seq
+//   if ack was dropped by chaos, do not exit yet (wait for sender retransmit)
+//   if ack was actually sent, close output file and exit
 
 // chaos rules (ack loss simulation):
 // - receiver drops every rn-th ack (including SOT and EOT acks)
 // - use ChaosEngine.shouldDrop(ackCount, rn)
 // - ackCount increments for every ack "attempt" (even if dropped)
 
+// note (gbn):
+// - this receiver is written to be "universal" (no window arg required)
+
+import java.io.File;
 import java.io.FileOutputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -51,8 +57,12 @@ public class Receiver
     private int expectedseq;
     private int lastinorder;
 
-    // chaos state
+    // chaos state (1-indexed "intended ack" count)
     private int ackcount;
+
+    // mode flags (stop-and-wait now; can enable gbn later)
+    private boolean gbnmode;
+    private int windowsize;
 
     public static void main(String[] args)
     {
@@ -95,16 +105,29 @@ public class Receiver
             return;
         }
 
-        Integer rnvalue = parsenonnegativeint(rntext, "RN");
+        if (outputfiletext.length() == 0)
+        {
+            System.out.println("output_file is required.");
+            return;
+        }
+
+        // validate output file path early (so we dont fail during handshake)
+        if (!validateoutputfile(outputfiletext))
+        {
+            return;
+        }
+
+        // rn can be negative; treat it as 0 (no ack loss)
+        Integer rnvalue = parseint(rntext, "RN");
         if (rnvalue == null)
         {
             return;
         }
 
-        if (outputfiletext.length() == 0)
+        if (rnvalue < 0)
         {
-            System.out.println("output_file is required.");
-            return;
+            System.out.println("RN is negative. treating RN as 0 (no ACK loss).");
+            rnvalue = 0;
         }
 
         try
@@ -127,6 +150,10 @@ public class Receiver
         expectedseq = 1;
         lastinorder = 0;
         ackcount = 0;
+
+        // stop-and-wait is default
+        gbnmode = false;
+        windowsize = -1;
 
         try
         {
@@ -187,7 +214,7 @@ public class Receiver
             }
             else if (type == DSPacket.TYPE_DATA)
             {
-                handledatastopandwait(p, seq);
+                handledatapacket(p, seq);
             }
             else if (type == DSPacket.TYPE_EOT)
             {
@@ -201,6 +228,21 @@ public class Receiver
             {
                 // ignore unknown packets
             }
+        }
+    }
+
+    // this router keeps receiver "universal"
+    // - right now it always behaves as stop-and-wait
+    private void handledatapacket(DSPacket p, int seq) throws Exception
+    {
+        if (gbnmode)
+        {
+            // jason: implement gbn receive here later (buffering + cumulative acks)
+            handledatagobackn(p, seq);
+        }
+        else
+        {
+            handledatastopandwait(p, seq);
         }
     }
 
@@ -272,7 +314,14 @@ public class Receiver
         }
     }
 
-    // teardown: on eot, ack and exit
+    // jason: go-back-n receiver logic here
+    private void handledatagobackn(DSPacket p, int seq) throws Exception
+    {
+        // not implemented in stop-and-wait version.
+        // for jason to do
+    }
+
+    // teardown: on eot, ack and exit only if the ack was actually sent (not dropped)
     private boolean handleeot(int seq) throws Exception
     {
         if (!handshaked)
@@ -283,24 +332,32 @@ public class Receiver
 
         System.out.println("received EOT seq=" + seq);
 
-        sendack(seq);
+        boolean sent = sendack(seq);
 
-        // close file and finish
-        try
+        if (sent)
         {
-            if (out != null)
+            // only close after the eot ack is actually sent
+            try
             {
-                out.close();
-                out = null;
+                if (out != null)
+                {
+                    out.close();
+                    out = null;
+                }
             }
-        }
-        catch (Exception ex)
-        {
-            // ignore
-        }
+            catch (Exception ex)
+            {
+                // ignore
+            }
 
-        System.out.println("transfer complete. receiver exiting.");
-        return true;
+            System.out.println("transfer complete. receiver exiting.");
+            return true;
+        }
+        else
+        {
+            System.out.println("eot ack was dropped. waiting for sender to retransmit eot...");
+            return false;
+        }
     }
 
     // udp helpers
@@ -323,7 +380,16 @@ public class Receiver
         }
     }
 
-    private void sendack(int seq) throws Exception
+    private void sendpacket(DSPacket packet, InetAddress addr, int port) throws Exception
+    {
+        byte[] bytes = packet.toBytes();
+
+        DatagramPacket dp = new DatagramPacket(bytes, bytes.length, addr, port);
+        datasock.send(dp);
+    }
+
+    // returns true if ack was actually sent, false if dropped (or failed to send)
+    private boolean sendack(int seq)
     {
         // increment ackcount for every ack attempt (even if dropped)
         ackcount++;
@@ -333,17 +399,22 @@ public class Receiver
         if (drop)
         {
             System.out.println("sending ACK seq=" + seq + " (dropped by chaos) ackcount=" + ackcount + " rn=" + rn);
-            return;
+            return false;
         }
 
         System.out.println("sending ACK seq=" + seq + " ackcount=" + ackcount + " rn=" + rn);
 
-        DSPacket ack = new DSPacket(DSPacket.TYPE_ACK, seq, null);
-
-        byte[] bytes = ack.toBytes();
-
-        DatagramPacket dp = new DatagramPacket(bytes, bytes.length, senderaddr, senderackport);
-        datasock.send(dp);
+        try
+        {
+            DSPacket ack = new DSPacket(DSPacket.TYPE_ACK, seq, null);
+            sendpacket(ack, senderaddr, senderackport);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            System.out.println("warning: failed to send ACK seq=" + seq + " : " + ex.getMessage());
+            return false;
+        }
     }
 
     // validation helpers
@@ -399,6 +470,79 @@ public class Receiver
         }
 
         return v;
+    }
+
+    private Integer parseint(String text, String name)
+    {
+        if (text == null)
+        {
+            text = "";
+        }
+
+        text = text.trim();
+
+        if (text.length() == 0)
+        {
+            System.out.println(name + " is required.");
+            return null;
+        }
+
+        int v;
+
+        try
+        {
+            v = Integer.parseInt(text);
+        }
+        catch (Exception ex)
+        {
+            System.out.println(name + " must be a number.");
+            return null;
+        }
+
+        return v;
+    }
+
+    private boolean validateoutputfile(String path)
+    {
+        try
+        {
+            File f = new File(path);
+
+            if (f.exists() && f.isDirectory())
+            {
+                System.out.println("output_file is a directory, not a file.");
+                return false;
+            }
+
+            File parent = f.getAbsoluteFile().getParentFile();
+            if (parent != null)
+            {
+                if (!parent.exists())
+                {
+                    System.out.println("output_file parent directory does not exist: " + parent.getPath());
+                    return false;
+                }
+
+                if (!parent.canWrite())
+                {
+                    System.out.println("output_file parent directory is not writable: " + parent.getPath());
+                    return false;
+                }
+            }
+
+            if (f.exists() && !f.canWrite())
+            {
+                System.out.println("output_file is not writable: " + path);
+                return false;
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            System.out.println("output_file is invalid: " + ex.getMessage());
+            return false;
+        }
     }
 
     private void printusage()

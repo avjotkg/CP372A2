@@ -35,9 +35,10 @@
 // - receiver may drop every rn-th ack (including SOT and EOT acks)
 // - sender must tolerate lost acks using timeouts + retransmissions
 
-// cli (stop-and-wait):
-// java Sender <rcv_ip> <rcv_data_port> <sender_ack_port> <input_file> <timeout_ms>
-// if an extra [window_size] is provided, gbn is not implemented here (partner will extend)
+// cli:
+// java Sender <rcv_ip> <rcv_data_port> <sender_ack_port> <input_file> <timeout_ms> [window_size]
+// - omit window_size => stop-and-wait (implemented here)
+// - provide window_size => gbn (not implemented here; partner will extend)
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -53,6 +54,10 @@ public class Sender
     private int senderackport;
     private String inputfile;
     private int timeoutms;
+
+    // optional (jason will use for gbn)
+    private boolean gbnmode;
+    private int windowsize;
 
     // udp socket (sender listens for acks on sender_ack_port)
     private DatagramSocket sock;
@@ -74,18 +79,11 @@ public class Sender
         // 2 sender_ack_port
         // 3 input_file
         // 4 timeout_ms
-        // [5 window_size] optional (gbn not implemented in this file)
+        // [5 window_size] optional (jason will extend)
 
         if (args == null || args.length < 5)
         {
             printusage();
-            return;
-        }
-
-        if (args.length > 5)
-        {
-            System.out.println("gbn mode detected (window_size provided), but gbn is not implemented in this sender yet.");
-            System.out.println("run without window_size for stop-and-wait.");
             return;
         }
 
@@ -94,6 +92,31 @@ public class Sender
         String senderackporttext = args[2].trim();
         String inputfiletext = args[3].trim();
         String timeoutmstext = args[4].trim();
+
+        // optional window size (gbn)
+        gbnmode = false;
+        windowsize = -1;
+
+        if (args.length > 6)
+        {
+            printusage();
+            return;
+        }
+
+        if (args.length == 6)
+        {
+            // gbn requested
+            gbnmode = true;
+
+            String windowsizetext = args[5].trim();
+            Integer w = parsenonnegativeint(windowsizetext, "window_size");
+            if (w == null)
+            {
+                return;
+            }
+
+            windowsize = w;
+        }
 
         if (rcviptext.length() == 0)
         {
@@ -169,7 +192,15 @@ public class Sender
             // start timer at first SOT send
             startms = -1;
 
-            dostopandwait();
+            if (gbnmode)
+            {
+                // jason will extend this (stub below)
+                dosendgbn(windowsize);
+            }
+            else
+            {
+                dostopandwait();
+            }
         }
         catch (Exception ex)
         {
@@ -200,8 +231,8 @@ public class Sender
             return;
         }
 
-        // phase 2: data transfer
-        int lastdataseq = dostreamfile();
+        // phase 2: data transfer (stop-and-wait)
+        int lastdataseq = dosendstopandwait();
         if (lastdataseq < 0)
         {
             // critical failure already printed
@@ -214,6 +245,14 @@ public class Sender
         {
             return;
         }
+    }
+
+    // go-back-n sender entry point
+    // for jason to do later
+    private void dosendgbn(int windowsize) throws Exception
+    {
+        System.out.println("gbn mode detected (window_size provided), but gbn is not implemented in this sender yet.");
+        System.out.println("will implement dosendgbn(window_size) later.");
     }
 
     // handshake: send sot seq=0, wait for ack seq=0
@@ -254,6 +293,13 @@ public class Sender
         }
     }
 
+    // wrapper name matches the structure you wanted (handshake -> send -> teardown)
+    // to extend
+    private int dosendstopandwait() throws Exception
+    {
+        return dostreamfile();
+    }
+
     // sends the file as stop-and-wait data packets; returns last data seq, or -1 on failure
     private int dostreamfile() throws Exception
     {
@@ -279,7 +325,7 @@ public class Sender
 
             while (true)
             {
-                int bytesread = in.read(buffer);
+                int bytesread = readchunk(in, buffer);
                 if (bytesread < 0)
                 {
                     break;
@@ -316,6 +362,46 @@ public class Sender
         }
 
         return lastdataseq;
+    }
+
+    // reads up to 124 bytes, but tries hard to fill the chunk unless EOF is reached
+    // returns:
+    // -1 if EOF and no bytes read
+    // 1..124 for payload size
+    private int readchunk(FileInputStream in, byte[] buffer) throws Exception
+    {
+        int total = 0;
+
+        while (total < buffer.length)
+        {
+            int n = in.read(buffer, total, buffer.length - total);
+
+            if (n < 0)
+            {
+                break;
+            }
+
+            if (n == 0)
+            {
+                // should not happen for FileInputStream, but dont loop forever
+                break;
+            }
+
+            total += n;
+
+            // if we filled the payload, stop
+            if (total == buffer.length)
+            {
+                break;
+            }
+        }
+
+        if (total == 0)
+        {
+            return -1;
+        }
+
+        return total;
     }
 
     // teardown: send eot seq=(last data + 1) mod 128, wait for ack
@@ -396,6 +482,19 @@ public class Sender
         sock.send(dp);
     }
 
+    // receive helpers
+
+    private DSPacket receivepacket() throws Exception
+    {
+        byte[] buf = new byte[DSPacket.MAX_PACKET_SIZE];
+        DatagramPacket dp = new DatagramPacket(buf, buf.length);
+
+        sock.receive(dp);
+
+        // parse raw 128 bytes into dspacket
+        return new DSPacket(dp.getData());
+    }
+
     // ack receive helpers
 
     private DSPacket receiveack(int expectedseq)
@@ -407,12 +506,7 @@ public class Sender
         {
             try
             {
-                byte[] buf = new byte[DSPacket.MAX_PACKET_SIZE];
-                DatagramPacket dp = new DatagramPacket(buf, buf.length);
-
-                sock.receive(dp);
-
-                DSPacket p = new DSPacket(dp.getData());
+                DSPacket p = receivepacket();
 
                 if (p.getType() != DSPacket.TYPE_ACK)
                 {
