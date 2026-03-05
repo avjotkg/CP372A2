@@ -251,8 +251,40 @@ public class Sender
     // for jason to do later
     private void dosendgbn(int windowsize) throws Exception
     {
-        System.out.println("gbn mode detected (window_size provided), but gbn is not implemented in this sender yet.");
-        System.out.println("will implement dosendgbn(window_size) later.");
+        //Data Validation with doc constraints
+        if (windowsize <= 0){
+            System.out.println("windowsize must be > 0");
+            return;
+        }
+
+        if (windowsize > 64){
+            System.out.println("windowsize must be <= 64 (mod safe)");
+            return;
+        }
+        if (windowsize % 4 != 0) {
+            System.out.println("windowsize must be multiple of 4");
+            return;
+        }
+
+        // GBN P1 - Handshake
+
+        boolean ok = dohandshake();
+        if (!ok){
+            return;
+        }
+        
+        // GBN P2 - Data Transfer
+        int lastdataseq = dosendgbndata(windowsize); //Reuse same function as S&W
+        if (lastdataseq < 0){
+            return; //Would mean that a crit failure has already been printed
+        }
+
+        // GBN P3 - Teardown
+        ok = doteardown(lastdataseq);
+        if (!ok){
+            return;
+        }
+
     }
 
     // handshake: send sot seq=0, wait for ack seq=0
@@ -287,7 +319,7 @@ public class Sender
 
             if (timeoutcount >= 3)
             {
-                System.out.println("Unable to transfer file.");
+                System.out.println("unable to transfer file.");
                 return false;
             }
         }
@@ -598,4 +630,191 @@ public class Sender
         System.out.println("  omit window_size for stop-and-wait (implemented here).");
         System.out.println("  provide window_size for gbn (partner will extend).");
     }
+
+    private int dosendgbndata(int window_size) throws Exception{
+        File f = new File(inputfile);
+
+        //emply file - no data packets, last data seq stays at 0
+
+        if (f.length() == 0){
+            System.out.println("input file is empty. sending no DATA packets.");
+            return 0;
+        }
+
+        //Build all data packets first
+        DSPacket[] packets = builddatapackets(f);
+        if (packets == null || packets.length == 0){
+            return 0;
+        }
+
+        int total = packets.length;
+        int base = 0;
+        int next = 0;
+        int timeoutcount = 0;
+
+        //Mod 128 since the pack num wraps around
+        int lastdataseq = packets[total - 1].getSeqNum() % 128;
+
+        while (base < total){
+
+            if (next < total && (next - base) < window_size){
+                int burstStart = next;
+                int burstEnd = Math.min(total, base + window_size);
+                //Send just the new packs
+
+                sendgbnburst(packets, burstStart, burstEnd);
+                next = burstEnd;
+
+            }
+
+            DSPacket ack = receiveackany();
+            //If there is no ACK on timeout, return following error
+            if (ack == null){
+                timeoutcount++;
+                System.out.println("timeout waiting for ACK (base seq=" + (packets[base].getSeqNum() % 128) + ", count=" + timeoutcount + ")");
+                if (timeoutcount >= 3){
+                    System.out.println("unable to transfer file.");
+                    return -1;
+                }
+                
+                //Resend the entire window from base (or just the full window if outside range)
+                int resendEnd = Math.min(total, base + window_size);
+                System.out.println("GBN timeout: retransmitting window [" + base + ", " + (resendEnd - 1) + "]");
+
+                sendgbnburst(packets, base, resendEnd);
+                continue;
+            }
+
+            //Ignore non ack
+            if (ack.getType() != DSPacket.TYPE_ACK){
+                continue;
+            }
+
+            //Reconvert down to 128 size.
+            int ackSeq = ack.getSeqNum() % 128;
+            int baseSeq = packets[base].getSeqNum() % 128;
+
+            int lastOutstandingInx = next - 1;
+            if (lastOutstandingInx < base){
+                //There is nothing outstanding, we can skip.
+                continue;
+            }
+            
+            int lastOutstandingSeq = packets[lastOutstandingInx].getSeqNum() % 128;
+            int dist = seqdistance(baseSeq, ackSeq);
+
+            /*
+            ACK must be wihtin outstanding window
+            - Dist < windowsize
+            - ackSeq must not be beyond last outstanding sent seq in this window        
+            */
+            int outstandingCount = lastOutstandingInx - base + 1;
+            if (dist < window_size && dist < outstandingCount){
+                int newBase = base + (dist + 1);
+                if (newBase > base){
+                    System.out.println("received cumulative ACK seq=" + ackSeq + " (advancing base from " + (packets[base].getSeqNum() % 128) + " to " + ((newBase < total) ? (packets[newBase].getSeqNum() % 128) : "DONE") + ")");   
+                    base = newBase;
+                    timeoutcount = 0;
+                }
+            } else {
+                System.out.println("ignoring ACK seq=" + ackSeq + " (base=" + baseSeq + ", lastSent=" + lastOutstandingSeq + ")");
+            }
+        }
+        return lastdataseq;
+    }
+
+    private DSPacket[] builddatapackets(File f) throws Exception {
+        FileInputStream in = null;
+        try {
+            in = new FileInputStream(f);
+            long len = f.length();
+            int count = (int)((len + DSPacket.MAX_PAYLOAD_SIZE - 1) / DSPacket.MAX_PAYLOAD_SIZE);
+            DSPacket[] packets = new DSPacket[count];
+
+            byte[] buffer = new byte[DSPacket.MAX_PAYLOAD_SIZE];
+            int seq = 1;
+            int idx = 0;
+
+            while (true){
+                int bytesread = readchunk(in, buffer);
+                if (bytesread < 0){
+                    break;
+                }
+                byte[] payload = new byte[bytesread];
+                System.arraycopy(buffer, 0, payload, 0, bytesread);
+                packets[idx] = new DSPacket(DSPacket.TYPE_DATA, seq, payload );
+                idx ++;
+                seq = (seq + 1) % 128;
+            }
+
+            if (idx != packets.length){
+                DSPacket [] shrunk = new DSPacket[idx];
+                System.arraycopy(packets, 0, shrunk, 0, idx);
+                packets = shrunk;
+            }
+            return packets;
+        } finally {
+            try {
+                if (in != null ){
+                    in.close();
+                }
+            } catch (Exception ex){
+                //Nothing
+            }
+        }
+    }
+
+    private int seqdistance(int a, int b){
+        int d = (b - a) % 128;
+        if (d < 0){
+            d += 128;
+        }
+        return d;
+    }
+
+    private void sendgbnpacket (DSPacket p) throws Exception {
+        System.out.println("sending DATA seq=" + (p.getSeqNum() % 128) + " len=" + p.getLength());        sendpacket(p);
+    }
+
+    private void sendgbnburst(DSPacket[] packets, int startIdx, int endIdx) throws Exception{
+        int i = startIdx;
+        while (i < endIdx){
+            int remaining = endIdx - i;
+            if (remaining >= 4){
+                //Send the packets in order +2, i, +3, +1
+                sendgbnpacket(packets[i + 2]);
+                sendgbnpacket(packets[i]);
+                sendgbnpacket(packets[i + 3]);
+                sendgbnpacket(packets[i + 1]);
+                i += 4;
+
+            } else {
+                for (int k = i; k < endIdx; k ++){
+                    sendgbnpacket(packets[k]);
+                }
+                break;
+            }
+        }
+    }
+
+    private DSPacket receiveackany() {
+        while (true){
+            try {
+                DSPacket p = receivepacket();
+                if (p.getType() != DSPacket.TYPE_ACK){
+                    continue;
+                }
+                return p;
+            }
+            catch (java.net.SocketTimeoutException ex){
+                return null;
+            }
+            catch (Exception ex){
+                //Ignore
+            }
+        }
+    }
+
+
+
 }
