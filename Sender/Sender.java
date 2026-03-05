@@ -1,4 +1,4 @@
-/ sender protocol notes for ds-ftp stop-and-wait (rdt 3.0)
+// sender protocol notes for ds-ftp stop-and-wait (rdt 3.0)
 
 // packet types (byte 0):
 // 0 = SOT (start of transmission)
